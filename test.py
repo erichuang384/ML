@@ -2,9 +2,11 @@ import MLCE_CWBO2025.virtual_lab as virtual_lab
 import numpy as np
 from scipy.stats import norm
 from scipy.linalg import cho_factor, cho_solve
+import time
 from datetime import datetime
 import random
 import matplotlib.pyplot as plt
+import sobol_seq
 
 # =============== Objective ===============
 def objective_func(X: list):
@@ -23,10 +25,29 @@ def encode(X):
     return np.hstack([normed, onehot])
 
 def sobol_initial_samples(n):
-    import sobol_seq
+    # Generate Sobol points in 5 dimensions
     pts = sobol_seq.i4_sobol_generate(5, n)
-    return [[30 + 10*p[0], 6 + 2*p[1], 50*p[2], 50*p[3], 50*p[4],
-             random.choice(['celltype_1','celltype_2','celltype_3'])] for p in pts]
+
+    # Assign cell types as evenly as possible
+    base_count = n // 3
+    remainder = n % 3
+    celltypes = ['celltype_1']*base_count + ['celltype_2']*base_count + ['celltype_3']*base_count
+    # distribute remainder
+    for i in range(remainder):
+        celltypes.append(f'celltype_{i+1}')
+    random.shuffle(celltypes)
+
+    samples = [
+        [
+            30 + 10*p[0],
+            6 + 2*p[1],
+            50*p[2],
+            50*p[3],
+            50*p[4],
+            celltypes[i]
+        ] for i, p in enumerate(pts)
+    ]
+    return samples
 
 # =============== GP (Matérn 5/2, scalar length-scale) ===============
 class GP:
@@ -111,7 +132,7 @@ class Acquisition:
 # =============== Batch methods ===============
 class BatchMethods:
     @staticmethod
-    def local_penalization(cand_enc, acq_vals, chosen_external, n_batch, radius=0.25):
+    def local_penalization(cand_enc, acq_vals, chosen_external, n_batch, radius=0.01):
         sel = []
         vals = acq_vals.copy()
         vals[list(chosen_external)] = -np.inf
@@ -121,7 +142,7 @@ class BatchMethods:
                 cont = cand_enc[:, :5]
                 chosen_cont = cont[sel]
                 d = np.linalg.norm(cont[:, None, :] - chosen_cont[None, :, :], axis=2)
-                penalties = 0.9 * np.exp(-0.5 * (np.min(d, axis=1) / radius)**2)
+                penalties = 0.5 * np.exp(-0.5 * (np.min(d, axis=1) / radius)**2)
                 vals = vals * (1.0 - penalties)
             vals[sel] = -np.inf
             pick = int(np.argmax(vals))
@@ -129,7 +150,7 @@ class BatchMethods:
         return sel
 
     @staticmethod
-    def thompson_sampling(gp, cand_enc, chosen_external, n_batch, n_samples=200):
+    def thompson_sampling(gp, cand_enc, chosen_external, n_batch, n_samples=800):
         sel = []
         mu, sigma = gp.predict(cand_enc)
         sigma = np.maximum(sigma, 1e-12)
@@ -147,29 +168,57 @@ class BatchMethods:
             sel.append(idx)
             mask[idx] = False
         return sel
-
+    
     @staticmethod
     def kriging_believer(gp, cand_enc, chosen_external, n_batch, acq_func):
-        sel = []
-        X_train = gp.X.copy()
-        y_train = (gp.alpha.ravel() * gp.y_std) + gp.y_mean
+        """
+        Batch selection via Kriging Believer for GP that normalizes y and stores (X, alpha, y_mean, y_std).
+        """
+        # Shapes and inputs
+        X_train = np.asarray(gp.X, dtype=float)
+        cand_enc = np.atleast_2d(cand_enc)
+        assert X_train.ndim == 2, "gp.X must be (N, D)"
+        assert cand_enc.ndim == 2, "cand_enc must be (M, D)"
+        M = cand_enc.shape[0]
+
+        # Reconstruct raw training targets:
+        # y_norm = K @ alpha; y_raw = y_norm * y_std + y_mean
+        K = gp.matern52(X_train, X_train) + np.eye(X_train.shape[0]) * gp.noise
+        y_norm = (K @ gp.alpha).ravel()
+        y_train = y_norm * gp.y_std + gp.y_mean
+
+        # Temporary GP clone and fit
         gp_temp = GP(ls=gp.ls, sf=gp.sf, noise=gp.noise)
         gp_temp.fit(X_train, y_train)
 
-        mask = np.ones(len(cand_enc), dtype=bool)
-        mask[list(chosen_external)] = False
+        # Build exclusion mask
+        mask = np.ones(M, dtype=bool)
+        if chosen_external is not None:
+            idx_ext = np.array(list(map(int, chosen_external)), dtype=int)
+            idx_ext = idx_ext[(idx_ext >= 0) & (idx_ext < M)]
+            mask[idx_ext] = False
 
-        for i in range(n_batch):
-            mu, sigma = gp_temp.predict(cand_enc)
+        sel = []
+        for i in range(int(n_batch)):
+            # Predict on candidates (mu, sigma are RAW scale per your GP.predict)
+            mu, sigma = gp_temp.predict(cand_enc)  # (M,), (M,)
             acq_vals = acq_func(mu, sigma)
+            if acq_vals.shape[0] != M:
+                raise ValueError("acq_func must return shape (M,)")
+
+            # Exclude externally chosen and already selected
             acq_vals[~mask] = -np.inf
-            acq_vals[sel] = -np.inf
+            if sel:
+                acq_vals[np.array(sel, dtype=int)] = -np.inf
+
+            # Pick next index
             idx = int(np.argmax(acq_vals))
             sel.append(idx)
 
+            # Kriging Believer: fantasize y = mu[idx], refit temp GP
             if i < n_batch - 1:
-                X_train = np.vstack([X_train, cand_enc[idx]])
-                y_train = np.append(y_train, mu[idx])
+                X_train = np.vstack([X_train, cand_enc[idx][None, :]])  # keep (1,D) for vstack
+                y_train = np.append(y_train, mu[idx])                   # mu is RAW scale
                 gp_temp.fit(X_train, y_train)
 
         return sel
@@ -188,9 +237,178 @@ class BatchMethods:
             # Exploitation / standard batch method
             mu, sigma = gp.predict(cand_enc)      # <-- evaluate GP
             acq_vals = acq_func(mu, sigma)        # <-- compute acquisition values
-            return BatchMethods.kriging_believer(gp, cand_enc, chosen_external, n_batch, acq_func)
+            #return BatchMethods.kriging_believer(gp, cand_enc, chosen_external, n_batch, acq_func)
             return BatchMethods.local_penalization(cand_enc, acq_vals, chosen_external, n_batch, radius)
+        
+    @staticmethod
+    def simulation_matching(gp, cand_enc, chosen_external, n_batch, acq_func):
+        """
+        Batch selection via simulation matching (hallucination):
+        - Select point with highest acquisition
+        - Hallucinate its outcome by sampling from GP posterior
+        - Update GP temporarily with hallucinated point
+        - Repeat for remaining batch
+        """
+        X_train = np.asarray(gp.X, dtype=float)
+        cand_enc = np.atleast_2d(cand_enc)
+        M = cand_enc.shape[0]
+        
+        # Reconstruct raw training targets
+        K = gp.matern52(X_train, X_train) + np.eye(X_train.shape[0]) * gp.noise
+        y_norm = (K @ gp.alpha).ravel()
+        y_train = y_norm * gp.y_std + gp.y_mean
+        
+        # Temporary GP for hallucination
+        gp_temp = GP(ls=gp.ls, sf=gp.sf, noise=gp.noise)
+        gp_temp.fit(X_train, y_train)
+        
+        # Build exclusion mask
+        mask = np.ones(M, dtype=bool)
+        if chosen_external is not None:
+            idx_ext = np.array(list(map(int, chosen_external)), dtype=int)
+            idx_ext = idx_ext[(idx_ext >= 0) & (idx_ext < M)]
+            mask[idx_ext] = False
+        
+        sel = []
+        for i in range(int(n_batch)):
+            # Predict on candidates
+            mu, sigma = gp_temp.predict(cand_enc)
+            acq_vals = acq_func(mu, sigma)
+            
+            # Exclude externally chosen and already selected
+            acq_vals[~mask] = -np.inf
+            if sel:
+                acq_vals[np.array(sel, dtype=int)] = -np.inf
+            
+            # Pick next index
+            idx = int(np.argmax(acq_vals))
+            sel.append(idx)
+            
+            # Hallucinate: sample from GP posterior at selected point
+            if i < n_batch - 1:
+                hallucinated_y = np.random.normal(mu[idx], sigma[idx])
+                X_train = np.vstack([X_train, cand_enc[idx][None, :]])
+                y_train = np.append(y_train, hallucinated_y)
+                gp_temp.fit(X_train, y_train)
+        
+        return sel
 
+
+    @staticmethod
+    def moo_adaptive(gp, cand_enc, chosen_external, n_batch, acq_func, it, top_k=5000):
+        """
+        Fast adaptive batch via multi-objective optimization (exploitation + diversity).
+        - Exploitation: acq_func(mu, sigma)
+        - Diversity: distance to already selected points (normalized continuous subspace),
+                     or posterior sigma when no points selected yet.
+        - Selection: greedy. Each pick:
+            * Pre-filter to top_k by exploitation for speed.
+            * Compute diversity on subset only.
+            * Compute Pareto skyline in O(K log K) (sort f1 desc, keep points with f2 >= running max).
+            * Choose the non-dominated point with largest weighted sum.
+        """
+
+        cand_enc = np.atleast_2d(cand_enc)
+        M = cand_enc.shape[0]
+        cont = cand_enc[:, :5]  # normalized continuous features
+
+        # Posterior
+        mu, sigma = gp.predict(cand_enc)
+        sigma = np.maximum(sigma, 1e-12)
+
+        # Exploitation objective
+        f1_all = acq_func(mu, sigma).astype(float)
+
+        # Initialize validity mask
+        valid_mask = np.ones(M, dtype=bool)
+        if chosen_external is not None and len(chosen_external) > 0:
+            ext = np.array(chosen_external, dtype=int)
+            ext = ext[(ext >= 0) & (ext < M)]
+            valid_mask[ext] = False
+
+        sel = []
+        selected_cont = cont[~valid_mask]  # any externally excluded are treated as already "selected" for diversity
+
+        # Adaptive weights
+        if it < 3:
+            w_div, w_exp = 0.7, 0.3
+        elif it < 6:
+            w_div, w_exp = 0.5, 0.5
+        else:
+            w_div, w_exp = 0.2, 0.8
+
+        # Helpers
+        def normalize(v):
+            v = v.astype(float)
+            vmin, vmax = np.nanmin(v), np.nanmax(v)
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or (vmax - vmin) < 1e-12:
+                return np.zeros_like(v, dtype=float)
+            return (v - vmin) / (vmax - vmin + 1e-12)
+
+        def diversity_subset(sub_idx):
+            if selected_cont.shape[0] == 0:
+                return sigma[sub_idx].copy()
+            # distances from subset to selected points
+            A = cont[sub_idx][:, None, :] - selected_cont[None, :, :]
+            d = np.linalg.norm(A, axis=2)  # (K, |sel|)
+            return np.min(d, axis=1)       # (K,)
+
+        def pareto_skyline_2d_max(f1, f2):
+            # Returns boolean mask of non-dominated points (maximization), O(K log K)
+            order = np.argsort(f1)[::-1]  # sort by f1 descending
+            nd = np.zeros_like(f1, dtype=bool)
+            max_f2 = -np.inf
+            for idx in order:
+                if f2[idx] >= (max_f2 - 1e-15):
+                    nd[idx] = True
+                    if f2[idx] > max_f2:
+                        max_f2 = f2[idx]
+            return nd
+
+        for _ in range(int(n_batch)):
+            # Exclude already selected indices
+            if len(sel) > 0:
+                valid_mask[np.array(sel, dtype=int)] = False
+
+            valid_idx = np.where(valid_mask)[0]
+            if valid_idx.size == 0:
+                break
+
+            # Pre-filter to top_k by exploitation
+            f1_valid = f1_all[valid_idx]
+            if valid_idx.size > top_k:
+                kth = np.argpartition(f1_valid, -top_k)[-top_k:]
+                sub_idx = valid_idx[kth]
+            else:
+                sub_idx = valid_idx
+
+            # Compute diversity on subset
+            f2_sub = diversity_subset(sub_idx)
+
+            # Normalize both objectives on subset
+            f1_sub = f1_all[sub_idx]
+            f1n = normalize(f1_sub)
+            f2n = normalize(f2_sub)
+
+            # Pareto skyline on subset
+            nd_sub_mask = pareto_skyline_2d_max(f1n, f2n)
+
+            # Weighted sum; prefer non-dominated points
+            score = w_exp * f1n + w_div * f2n
+            if np.any(nd_sub_mask):
+                score_nd = np.where(nd_sub_mask, score, -np.inf)
+                pick_in_sub = int(np.argmax(score_nd))
+            else:
+                pick_in_sub = int(np.argmax(score))
+
+            idx = int(sub_idx[pick_in_sub])
+
+            sel.append(idx)
+            valid_mask[idx] = False
+            # Update selected_cont for next iteration
+            selected_cont = np.vstack([selected_cont, cont[idx][None, :]])
+
+        return sel
 
 
 # =============== BO Orchestrator ===============
@@ -260,16 +478,34 @@ class BO:
                 bo_idx = BatchMethods.kriging_believer(gp, self.cand_enc, chosen_external, n_bo, acq_fn)
             elif self.batch_method == 'adaptive' and n_bo > 0:
                 bo_idx = BatchMethods.adaptive_batch(gp, self.cand_enc, chosen_external, n_bo, acq_fn)
+            elif self.batch_method == 'simulation' and n_bo > 0:
+                bo_idx = BatchMethods.simulation_matching(gp, self.cand_enc, chosen_external, n_bo, acq_fn)
+            elif self.batch_method == 'moo_adaptive' and n_bo > 0:
+                bo_idx = BatchMethods.moo_adaptive(gp, self.cand_enc, chosen_external, n_bo, acq_fn, it)
             else:
                 bo_idx = []
 
             chosen = rand_idx + bo_idx if n_bo > 0 else rand_idx
 
+            # ===== Logging for best titre =====
+            # ===== Logging for best titre + conditions =====
             X_batch = [self.cand[i] for i in chosen]
             batch_Y = objective_func(X_batch)
 
-            prev_best = float(np.max(self.Y))  # Track previous best before update
+            prev_best = float(np.max(self.Y))  # best before this batch
 
+            # Check if this batch produced a new best
+            max_idx_in_batch = np.argmax(batch_Y)
+            max_val_in_batch = batch_Y[max_idx_in_batch]
+
+            if max_val_in_batch > prev_best:
+                cond_best = X_batch[max_idx_in_batch]
+                cond_str = f"T={cond_best[0]:.2f}, pH={cond_best[1]:.2f}, F1={cond_best[2]:.2f}, F2={cond_best[3]:.2f}, F3={cond_best[4]:.2f}, cell_type={cond_best[5]}"
+                print(f"Iteration {it}: Best Titre: {max_val_in_batch:.4f} → Updated! {cond_str}")
+            else:
+                print(f"Iteration {it}: Best Titre: {prev_best:.4f}")
+
+            # Now append to BO data
             self.Y = np.concatenate([self.Y, batch_Y])
             self.time += [datetime.timestamp(datetime.now()) - start_time] * len(batch_Y)
             self.X_enc = np.vstack([self.X_enc, self.cand_enc[chosen]])
@@ -277,15 +513,8 @@ class BO:
 
             self.batch_max_per_iter.append(float(np.max(batch_Y)))
             self.batch_mean_per_iter.append(float(np.mean(batch_Y)))
-            current_best = float(np.max(self.Y))
-            self.best_per_iter.append(current_best)
+            self.best_per_iter.append(max(prev_best, max_val_in_batch))
 
-            # ===== Logging for best titre =====
-            if current_best > prev_best:
-                print(f"Iteration {it}: Best Titre: {current_best:.4f} → Updated!")
-            else:
-                print(f"Iteration {it}: Best Titre: {current_best:.4f}")
-            
 
 class Plotter:
     @staticmethod
@@ -372,7 +601,8 @@ if __name__ == "__main__":
     if solo:
         # --------- Solo run ---------
         X_initial = sobol_initial_samples(6)
-        X_searchspace = sobol_initial_samples(10000)
+        X_searchspace = sobol_initial_samples(99999)
+        start_time = time.time()
 
         bo = BO(
             X_initial=X_initial,
@@ -381,7 +611,7 @@ if __name__ == "__main__":
             batch=batch_size,
             objective_func=objective_func,
             acq_kind="ei",                      # 'ei', 'nei', 'ucb'
-            batch_method="thompson_sampling",  # 'thompson_sampling', 'local_penalization', 'kriging_believer', 'adaptive'
+            batch_method="thompson_sampling",  # 'thompson_sampling', 'local_penalization', 'kriging_believer', 'adaptive', ''simulation', moo_adaptive
             random_fraction=0.3,
         )
 
@@ -389,7 +619,9 @@ if __name__ == "__main__":
         per_batch_scores = [0.0 if it < 3 else best for it, best in enumerate(bo.best_per_iter)]
         final_score = sum(per_batch_scores)
         print(f"\nFinal score for this solo run = {final_score:.3f}")
-
+        
+        end_time = time.time()
+        print(f"Elapsed time: {end_time - start_time:.2f} seconds")
         # Plot solo run
         Plotter.plot_solo_run(bo.best_per_iter, final_score, filename="solo_run_best_per_iter.png")
 
